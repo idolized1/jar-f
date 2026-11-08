@@ -1,4 +1,4 @@
-.github/workflows/build.yml
+
 name: Build Minecraft Mod Jar
 
 on:
