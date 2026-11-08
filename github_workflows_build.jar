@@ -1,0 +1,763 @@
+name: build
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Write sources
+        run: |
+          mkdir -p ac && cd ac
+          wfile() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
+
+          wfile settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'ac'
+          EOF
+
+          wfile gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          minecraft_version=1.21.11
+          yarn_mappings=1.21.11+build.6
+          loader_version=0.18.1
+          loom_version=1.14-SNAPSHOT
+
+          mod_version=1.0.0
+          maven_group=dev.venice
+          archives_base_name=ac
+          EOF
+
+          wfile build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version "${loom_version}"
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base { archivesName = project.archives_base_name }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") { expand "version": project.version }
+          }
+
+          tasks.withType(JavaCompile).configureEach { it.options.release = 21 }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          wfile src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "ac",
+            "version": "${version}",
+            "name": "ac",
+            "description": "",
+            "authors": [],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": { "client": ["dev.venice.ac.Ac"] },
+            "mixins": ["ac.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.18.1",
+              "minecraft": "~1.21.11",
+              "java": ">=21"
+            }
+          }
+          EOF
+
+          wfile src/main/resources/ac.mixins.json <<'EOF'
+          {
+            "required": true,
+            "minVersion": "0.8",
+            "package": "dev.venice.ac.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": ["KeyboardMixin", "HudMixin", "TickMixin", "NetworkMixin"],
+            "injectors": { "defaultRequire": 1 }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/Ac.java <<'EOF'
+          package dev.venice.ac;
+
+          import net.fabricmc.api.ClientModInitializer;
+
+          public class Ac implements ClientModInitializer {
+              @Override
+              public void onInitializeClient() {
+                  Config.load();
+                  ModuleManager.init();
+                  Runtime.getRuntime().addShutdownHook(new Thread(Config::save));
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/Module.java <<'EOF'
+          package dev.venice.ac;
+
+          import net.minecraft.client.MinecraftClient;
+
+          public abstract class Module {
+              protected static final MinecraftClient mc = MinecraftClient.getInstance();
+
+              public final String name;
+              public final int defaultKey;
+              public int key;
+              public boolean enabled;
+
+              protected Module(String name, int defaultKey) {
+                  this.name = name;
+                  this.defaultKey = defaultKey;
+                  this.key = defaultKey;
+              }
+
+              public void onEnable() {}
+              public void onDisable() {}
+              public void onTick() {}
+
+              public void toggle() {
+                  enabled = !enabled;
+                  if (enabled) onEnable(); else onDisable();
+                  Config.save();
+              }
+
+              protected boolean inGame() {
+                  return mc.player != null && mc.world != null && mc.interactionManager != null;
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/ModuleManager.java <<'EOF'
+          package dev.venice.ac;
+
+          import dev.venice.ac.modules.*;
+          import java.util.*;
+
+          public final class ModuleManager {
+              public static final List<Module> MODULES = new ArrayList<>();
+              public static final Map<Integer, Module> BY_KEY = new HashMap<>();
+
+              public static void init() {
+                  add(new AutoAnchor());
+                  add(new AnchorAura());
+                  add(new AutoTotem());
+                  add(new HoverTotem());
+                  add(new PopCounter());
+                  add(new HudList());
+                  MODULES.sort(Comparator.comparing(m -> m.name));
+                  for (Module m : MODULES) if (m.key > 0) BY_KEY.put(m.key, m);
+              }
+
+              private static void add(Module m) { MODULES.add(m); }
+
+              public static void onKey(int key) {
+                  Module m = BY_KEY.get(key);
+                  if (m != null) m.toggle();
+              }
+
+              public static void onTick() {
+                  for (Module m : MODULES) if (m.enabled) m.onTick();
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/Config.java <<'EOF'
+          package dev.venice.ac;
+
+          import com.google.gson.*;
+          import java.nio.file.*;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          public final class Config {
+              private static final Path FILE =
+                  FabricLoader.getInstance().getConfigDir().resolve("ac.json");
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+              public static void load() {
+                  try {
+                      if (!Files.exists(FILE)) return;
+                      JsonObject o = JsonParser.parseString(Files.readString(FILE)).getAsJsonObject();
+                      for (Module m : ModuleManager.MODULES) {
+                          if (o.has(m.name)) {
+                              JsonObject e = o.getAsJsonObject(m.name);
+                              if (e.has("key")) m.key = e.get("key").getAsInt();
+                              if (e.has("on") && e.get("on").getAsBoolean()) { m.enabled = true; m.onEnable(); }
+                          }
+                      }
+                      ModuleManager.BY_KEY.clear();
+                      for (Module m : ModuleManager.MODULES) if (m.key > 0) ModuleManager.BY_KEY.put(m.key, m);
+                  } catch (Exception ignored) {}
+              }
+
+              public static void save() {
+                  try {
+                      JsonObject o = new JsonObject();
+                      for (Module m : ModuleManager.MODULES) {
+                          JsonObject e = new JsonObject();
+                          e.addProperty("key", m.key);
+                          e.addProperty("on", m.enabled);
+                          o.add(m.name, e);
+                      }
+                      Files.createDirectories(FILE.getParent());
+                      Files.writeString(FILE, GSON.toJson(o));
+                  } catch (Exception ignored) {}
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/util/InvUtils.java <<'EOF'
+          package dev.venice.ac.util;
+
+          import java.util.function.Predicate;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.entity.player.PlayerInventory;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
+
+          public final class InvUtils {
+              private static final MinecraftClient mc = MinecraftClient.getInstance();
+
+              public static int hotbar(Predicate<ItemStack> p) {
+                  if (mc.player == null) return -1;
+                  for (int i = 0; i < 9; i++)
+                      if (p.test(mc.player.getInventory().getStack(i))) return i;
+                  return -1;
+              }
+
+              public static int anywhere(Predicate<ItemStack> p) {
+                  if (mc.player == null) return -1;
+                  PlayerInventory inv = mc.player.getInventory();
+                  for (int i = 0; i < inv.size(); i++)
+                      if (p.test(inv.getStack(i))) return i;
+                  return -1;
+              }
+
+              public static int toHandler(int invSlot) {
+                  if (invSlot < 9) return 36 + invSlot;
+                  if (invSlot < 36) return invSlot;
+                  if (invSlot == 40) return 45;
+                  return -1;
+              }
+
+              public static void select(int slot) {
+                  if (mc.player == null || mc.getNetworkHandler() == null) return;
+                  if (mc.player.getInventory().getSelectedSlot() == slot) return;
+                  mc.player.getInventory().setSelectedSlot(slot);
+                  mc.getNetworkHandler().sendPacket(new UpdateSelectedSlotC2SPacket(slot));
+              }
+
+              public static int detonatorSlot() {
+                  if (mc.player == null) return -1;
+                  for (int i = 0; i < 9; i++) {
+                      ItemStack s = mc.player.getInventory().getStack(i);
+                      if (s.isOf(net.minecraft.item.Items.NETHERITE_SWORD)
+                          || s.isOf(net.minecraft.item.Items.DIAMOND_SWORD)
+                          || s.isOf(net.minecraft.item.Items.IRON_SWORD)) return i;
+                  }
+                  for (int i = 0; i < 9; i++) {
+                      if (mc.player.getInventory().getStack(i).isEmpty()) return i;
+                  }
+                  return mc.player.getInventory().getSelectedSlot();
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/util/RotationUtils.java <<'EOF'
+          package dev.venice.ac.util;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
+          import net.minecraft.util.math.Vec3d;
+
+          public final class RotationUtils {
+              private static final MinecraftClient mc = MinecraftClient.getInstance();
+
+              public static void lookAt(Vec3d target) {
+                  if (mc.player == null || mc.getNetworkHandler() == null) return;
+                  Vec3d eyes = mc.player.getEyePos();
+                  double dx = target.x - eyes.x;
+                  double dy = target.y - eyes.y;
+                  double dz = target.z - eyes.z;
+                  float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+                  float pitch = (float) (-Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz))));
+
+                  mc.player.setYaw(yaw);
+                  mc.player.setPitch(pitch);
+                  mc.getNetworkHandler().sendPacket(new PlayerMoveC2SPacket.LookAndOnGround(
+                      yaw, pitch, mc.player.isOnGround(), mc.player.horizontalCollision));
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/util/BlockUtils.java <<'EOF'
+          package dev.venice.ac.util;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.hit.BlockHitResult;
+          import net.minecraft.util.math.BlockPos;
+          import net.minecraft.util.math.Direction;
+          import net.minecraft.util.math.Vec3d;
+
+          public final class BlockUtils {
+              private static final MinecraftClient mc = MinecraftClient.getInstance();
+
+              public static boolean place(BlockPos pos) {
+                  if (mc.player == null || mc.world == null || mc.interactionManager == null) return false;
+                  if (!mc.world.getBlockState(pos).isReplaceable()) return false;
+
+                  for (Direction d : Direction.values()) {
+                      BlockPos n = pos.offset(d);
+                      if (mc.world.getBlockState(n).isReplaceable()) continue;
+                      Direction side = d.getOpposite();
+                      Vec3d hit = Vec3d.ofCenter(n).add(Vec3d.of(side.getVector()).multiply(0.5));
+
+                      RotationUtils.lookAt(hit);
+                      ItemStack before = mc.player.getMainHandStack().copy();
+                      mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND,
+                          new BlockHitResult(hit, side, n, false));
+                      mc.player.swingHand(Hand.MAIN_HAND);
+
+                      ItemStack after = mc.player.getMainHandStack();
+                      if (before.getItem() != after.getItem() || before.getCount() != after.getCount()) return true;
+                      if (!mc.world.getBlockState(pos).isReplaceable()) return true;
+                  }
+                  return false;
+              }
+
+              public static void interact(BlockPos pos) {
+                  if (mc.player == null || mc.world == null || mc.interactionManager == null) return;
+                  Vec3d hit = Vec3d.ofCenter(pos).add(0, 0.5, 0);
+                  RotationUtils.lookAt(hit);
+                  mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND,
+                      new BlockHitResult(hit, Direction.UP, pos, false));
+                  mc.player.swingHand(Hand.MAIN_HAND);
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/modules/AutoAnchor.java <<'EOF'
+          package dev.venice.ac.modules;
+
+          import dev.venice.ac.Module;
+          import dev.venice.ac.util.BlockUtils;
+          import dev.venice.ac.util.InvUtils;
+          import net.minecraft.block.Blocks;
+          import net.minecraft.block.RespawnAnchorBlock;
+          import net.minecraft.item.Items;
+          import net.minecraft.util.hit.BlockHitResult;
+          import net.minecraft.util.hit.HitResult;
+          import net.minecraft.util.math.BlockPos;
+
+          public class AutoAnchor extends Module {
+              private static final int PLACE = 0, CHARGE = 1, DETONATE = 2;
+
+              private int state = PLACE;
+              private int timer = 0;
+              private BlockPos target;
+
+              public int charges = 4;
+              public int delay = 3;
+
+              public AutoAnchor() { super("AutoAnchor", 82); }
+
+              @Override
+              public void onDisable() { state = PLACE; target = null; timer = 0; }
+
+              private void reset() { state = PLACE; target = null; timer = 2; }
+
+              private int anchorCharges(BlockPos pos) {
+                  var s = mc.world.getBlockState(pos);
+                  if (s.getBlock() != Blocks.RESPAWN_ANCHOR) return -1;
+                  return s.get(RespawnAnchorBlock.CHARGES);
+              }
+
+              private BlockPos placePos() {
+                  HitResult hr = mc.player.raycast(4.5, 0f, false);
+                  if (hr.getType() == HitResult.Type.BLOCK) {
+                      BlockHitResult bhr = (BlockHitResult) hr;
+                      BlockPos p = bhr.getBlockPos().offset(bhr.getSide());
+                      if (mc.world.getBlockState(p).isReplaceable()) return p;
+                  }
+                  BlockPos feet = mc.player.getBlockPos();
+                  BlockPos fwd = feet.offset(mc.player.getHorizontalFacing());
+                  if (mc.world.getBlockState(fwd).isReplaceable() && !fwd.equals(feet)) return fwd;
+                  return null;
+              }
+
+              @Override
+              public void onTick() {
+                  if (!inGame()) return;
+                  if (timer > 0) { timer--; return; }
+
+                  switch (state) {
+                      case PLACE -> {
+                          BlockPos p = placePos();
+                          if (p == null) return;
+                          if (mc.world.getBlockState(p).getBlock() == Blocks.RESPAWN_ANCHOR) {
+                              target = p; state = CHARGE; return;
+                          }
+                          int slot = InvUtils.hotbar(s -> s.isOf(Items.RESPAWN_ANCHOR));
+                          if (slot == -1) return;
+                          InvUtils.select(slot);
+                          if (BlockUtils.place(p)) { target = p; state = CHARGE; timer = delay; }
+                      }
+                      case CHARGE -> {
+                          if (target == null) { reset(); return; }
+                          int c = anchorCharges(target);
+                          if (c < 0) { reset(); return; }
+                          if (c >= charges) { state = DETONATE; timer = delay; return; }
+                          int gs = InvUtils.hotbar(s -> s.isOf(Items.GLOWSTONE));
+                          if (gs == -1) { reset(); return; }
+                          InvUtils.select(gs);
+                          BlockUtils.interact(target);
+                          timer = delay;
+                      }
+                      case DETONATE -> {
+                          if (target == null) { reset(); return; }
+                          if (anchorCharges(target) <= 0) { reset(); return; }
+                          InvUtils.select(InvUtils.detonatorSlot());
+                          BlockUtils.interact(target);
+                          reset();
+                      }
+                  }
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/modules/AnchorAura.java <<'EOF'
+          package dev.venice.ac.modules;
+
+          import dev.venice.ac.Module;
+          import dev.venice.ac.util.BlockUtils;
+          import dev.venice.ac.util.InvUtils;
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.minecraft.block.Blocks;
+          import net.minecraft.block.RespawnAnchorBlock;
+          import net.minecraft.item.Items;
+          import net.minecraft.util.math.BlockPos;
+
+          public class AnchorAura extends Module {
+              public int range = 5;
+              public int delay = 2;
+
+              private int timer = 0;
+
+              public AnchorAura() { super("AnchorAura", 71); }
+
+              @Override
+              public void onDisable() { timer = 0; }
+
+              private List<BlockPos> anchors() {
+                  List<BlockPos> out = new ArrayList<>();
+                  BlockPos c = mc.player.getBlockPos();
+                  for (int x = -range; x <= range; x++)
+                      for (int y = -range; y <= range; y++)
+                          for (int z = -range; z <= range; z++) {
+                              BlockPos p = c.add(x, y, z);
+                              if (mc.world.getBlockState(p).getBlock() == Blocks.RESPAWN_ANCHOR) out.add(p);
+                          }
+                  return out;
+              }
+
+              @Override
+              public void onTick() {
+                  if (!inGame()) return;
+                  if (timer > 0) { timer--; return; }
+
+                  for (BlockPos p : anchors()) {
+                      int c = mc.world.getBlockState(p).get(RespawnAnchorBlock.CHARGES);
+                      if (c >= 4) {
+                          InvUtils.select(InvUtils.detonatorSlot());
+                          BlockUtils.interact(p);
+                          timer = delay * 2;
+                          return;
+                      }
+                      int gs = InvUtils.hotbar(s -> s.isOf(Items.GLOWSTONE));
+                      if (gs == -1) return;
+                      InvUtils.select(gs);
+                      BlockUtils.interact(p);
+                      timer = delay;
+                      return;
+                  }
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/modules/AutoTotem.java <<'EOF'
+          package dev.venice.ac.modules;
+
+          import dev.venice.ac.Module;
+          import dev.venice.ac.util.InvUtils;
+          import net.minecraft.item.Items;
+          import net.minecraft.screen.slot.SlotActionType;
+
+          public class AutoTotem extends Module {
+              public int delay = 2;
+              private int timer = 0;
+
+              public AutoTotem() { super("AutoTotem", 84); }
+
+              @Override
+              public void onDisable() { timer = 0; }
+
+              @Override
+              public void onTick() {
+                  if (!inGame()) return;
+                  if (timer > 0) { timer--; return; }
+                  if (mc.player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING)) return;
+
+                  int slot = InvUtils.anywhere(s -> s.isOf(Items.TOTEM_OF_UNDYING));
+                  if (slot < 0) return;
+
+                  mc.interactionManager.clickSlot(
+                      mc.player.playerScreenHandler.syncId,
+                      InvUtils.toHandler(slot), 40, SlotActionType.SWAP, mc.player);
+                  timer = delay;
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/modules/HoverTotem.java <<'EOF'
+          package dev.venice.ac.modules;
+
+          import dev.venice.ac.Module;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+
+          public class HoverTotem extends Module {
+              public int yOffset = 46;
+
+              public HoverTotem() { super("HoverTotem", 72); }
+
+              public static int totemCount() {
+                  if (mc.player == null) return 0;
+                  int n = 0;
+                  for (int i = 0; i < mc.player.getInventory().size(); i++) {
+                      ItemStack s = mc.player.getInventory().getStack(i);
+                      if (s.isOf(Items.TOTEM_OF_UNDYING)) n += s.getCount();
+                  }
+                  return n;
+              }
+
+              public void render(DrawContext ctx) {
+                  if (mc.player == null || mc.world == null) return;
+                  int w = ctx.getScaledWindowWidth();
+                  int h = ctx.getScaledWindowHeight();
+                  int x = w / 2 - 8;
+                  int y = h - yOffset;
+
+                  ctx.getMatrices().pushMatrix();
+                  ctx.getMatrices().translate((float) x, (float) y);
+                  ctx.getMatrices().scale(1.5f, 1.5f);
+                  ctx.drawItem(new ItemStack(Items.TOTEM_OF_UNDYING), 0, 0);
+                  ctx.getMatrices().popMatrix();
+
+                  ctx.drawTextWithShadow(mc.textRenderer, "x" + totemCount(),
+                      x + 26, y + 6, totemCount() > 0 ? 0xFFFFFFFF : 0xFFFF5555);
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/modules/PopCounter.java <<'EOF'
+          package dev.venice.ac.modules;
+
+          import dev.venice.ac.Module;
+          import java.util.HashMap;
+          import java.util.Map;
+          import java.util.UUID;
+          import net.minecraft.client.gui.DrawContext;
+
+          public class PopCounter extends Module {
+              private static final Map<UUID, Integer> POPS = new HashMap<>();
+
+              public PopCounter() { super("PopCounter", 74); }
+
+              public static void pop(UUID id) { POPS.merge(id, 1, Integer::sum); }
+
+              @Override
+              public void onDisable() { POPS.clear(); }
+
+              public void render(DrawContext ctx) {
+                  if (mc.world == null || POPS.isEmpty()) return;
+                  int y = 6;
+                  for (Map.Entry<UUID, Integer> e : POPS.entrySet()) {
+                      var p = mc.world.getPlayerByUuid(e.getKey());
+                      String n = p != null ? p.getName().getString() : e.getKey().toString().substring(0, 8);
+                      ctx.drawTextWithShadow(mc.textRenderer, n + " -" + e.getValue(), 6, y, 0xFFFF8080);
+                      y += 10;
+                  }
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/modules/HudList.java <<'EOF'
+          package dev.venice.ac.modules;
+
+          import dev.venice.ac.Module;
+          import dev.venice.ac.ModuleManager;
+          import net.minecraft.client.gui.DrawContext;
+
+          public class HudList extends Module {
+              public HudList() { super("HudList", 70); }
+
+              public void render(DrawContext ctx) {
+                  if (mc.player == null) return;
+                  int y = 6;
+                  for (Module m : ModuleManager.MODULES) {
+                      if (!m.enabled || m == this) continue;
+                      int w = mc.textRenderer.getWidth(m.name);
+                      ctx.drawTextWithShadow(mc.textRenderer, m.name,
+                          ctx.getScaledWindowWidth() - w - 6, y, 0xFF55FFFF);
+                      y += 10;
+                  }
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/mixin/KeyboardMixin.java <<'EOF'
+          package dev.venice.ac.mixin;
+
+          import dev.venice.ac.ModuleManager;
+          import net.minecraft.client.Keyboard;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.input.KeyInput;
+          import org.lwjgl.glfw.GLFW;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(Keyboard.class)
+          public class KeyboardMixin {
+              @Inject(method = "onKey", at = @At("HEAD"))
+              private void onKey(long window, int action, KeyInput input, CallbackInfo ci) {
+                  if (action != GLFW.GLFW_PRESS) return;
+                  if (MinecraftClient.getInstance().currentScreen != null) return;
+                  ModuleManager.onKey(input.key());
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/mixin/TickMixin.java <<'EOF'
+          package dev.venice.ac.mixin;
+
+          import dev.venice.ac.ModuleManager;
+          import net.minecraft.client.MinecraftClient;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(MinecraftClient.class)
+          public class TickMixin {
+              @Inject(method = "tick", at = @At("TAIL"))
+              private void tick(CallbackInfo ci) {
+                  ModuleManager.onTick();
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/mixin/HudMixin.java <<'EOF'
+          package dev.venice.ac.mixin;
+
+          import dev.venice.ac.ModuleManager;
+          import dev.venice.ac.modules.HoverTotem;
+          import dev.venice.ac.modules.HudList;
+          import dev.venice.ac.modules.PopCounter;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.hud.InGameHud;
+          import net.minecraft.client.render.RenderTickCounter;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(InGameHud.class)
+          public class HudMixin {
+              @Inject(method = "render", at = @At("TAIL"))
+              private void render(DrawContext ctx, RenderTickCounter counter, CallbackInfo ci) {
+                  if (MinecraftClient.getInstance().options.hudHidden) return;
+                  for (var m : ModuleManager.MODULES) {
+                      if (!m.enabled) continue;
+                      if (m instanceof HudList l) l.render(ctx);
+                      else if (m instanceof HoverTotem h) h.render(ctx);
+                      else if (m instanceof PopCounter p) p.render(ctx);
+                  }
+              }
+          }
+          EOF
+
+          wfile src/main/java/dev/venice/ac/mixin/NetworkMixin.java <<'EOF'
+          package dev.venice.ac.mixin;
+
+          import dev.venice.ac.modules.PopCounter;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.network.ClientPlayNetworkHandler;
+          import net.minecraft.network.packet.s2c.play.EntityStatusS2CPacket;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(ClientPlayNetworkHandler.class)
+          public class NetworkMixin {
+              @Inject(method = "onEntityStatus", at = @At("TAIL"))
+              private void onEntityStatus(EntityStatusS2CPacket packet, CallbackInfo ci) {
+                  if (packet.getStatus() != 35) return;
+                  var e = packet.getEntity(MinecraftClient.getInstance().world);
+                  if (e != null) PopCounter.pop(e.getUuid());
+              }
+          }
+          EOF
+
+          echo "wrote $(find . -type f | wc -l) files"
+
+      - name: Build
+        run: |
+          cd ac
+          gradle build --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: ac-jar
+          path: ac/build/libs/ac-1.0.0.jar
